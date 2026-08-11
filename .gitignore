@@ -1,0 +1,11 @@
+# Local datasets are too large for source control.
+datasets/
+
+# Python-generated files and local environments.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS metadata.
+.DS_Store
