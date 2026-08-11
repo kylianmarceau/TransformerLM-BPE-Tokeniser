@@ -67,6 +67,28 @@ def split_on_special_tokens(text: str, special_tokens: list[str], keep: bool,) -
 
     return regex.split(pattern, text)
 
+def pretokenize(text: str, ) -> list[tuple[bytes, ...]]:
+    # convert gpt2 pretokens into tuples of individual bytes
+    pretokens = []
+    for match in GPT2_pretoken_regex.finditer(text):
+        raw_bytes = match.group(0).encode("utf-8")
+        symbols = tuple(bytes([byte_value])for byte_value in raw_bytes) 
+        pretokens.append(symbols)
+
+    return pretokens
+
+def count_pretokens(text: str, special_tokens: list[str], ) -> Counter:
+    # count byte pre tokens wihtout counting the special tokens
+    counts: Counter = Counter()
+
+    for chunk in split_on_special_tokens(text, special_tokens, keep=False,):
+        if not chunk:
+            continue
+
+        counts.update(pretokenize(chunk))
+
+    return counts
+
 def count_pairs(word_freqs):
     """
     Count how often each adjacent pair of symbols occurs, weighted by pre-token frequency.
