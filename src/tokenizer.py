@@ -9,7 +9,7 @@ import regex
 
 END_OF_TEXT = "<|endoftext|>"
 
-WORD_START = "▁"      # ▁ marks the start of a word (written '_' in the lecture slides)
+'''WORD_START = "▁"      # ▁ marks the start of a word (written '_' in the lecture slides)
 UNK = "<|unk|>"
 
 def count_pretokens(text, special_tokens=(END_OF_TEXT,)):
@@ -31,7 +31,41 @@ def count_pretokens(text, special_tokens=(END_OF_TEXT,)):
 _toy_corpus = ("low low low low low\n"
                "lower lower widest widest widest\n"
                "newest newest newest newest newest newest")
-print(count_pretokens(_toy_corpus))
+print(count_pretokens(_toy_corpus))'''
+
+# gpt2 pre-tokenizer regex from appendix A
+GPT2_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+
+(?!\S)|\s+"""
+
+GPT2_pretoken_regex = regex.compile(GPT2_PAT)
+
+def validate_special_tokens(special_tokens: list[str] | None, ) -> list[str]:
+    # validate and copy the configured special token list
+    tokens = list(special_tokens or [])
+
+    if any(token == "" for token in tokens):
+        raise ValueError("Special tokens cannot be empty")
+
+    if len(tokens) != len(set(tokens)):
+        raise ValueError("Special tokens must be unique")
+
+    return tokens
+
+def split_on_special_tokens(text: str, special_tokens: list[str], keep: bool,) -> list[str]:
+    # split at the special tokens, toptionallu retaining them 
+    if not special_tokens:
+        return[text] 
+
+    #macth longer special tokens first 
+    ordered = sorted(special_tokens ,key=lambda token: (-len(token), token),)
+    alternatives = "|".join(regex.escape(token) for token in ordered)
+
+    if keep:
+        pattern = f"({alternatives})"
+    else:
+        pattern = f"(?:{alternatives})"
+
+    return regex.split(pattern, text)
 
 def count_pairs(word_freqs):
     """
