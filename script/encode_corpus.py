@@ -90,16 +90,11 @@ def train_selected_tokenizers(train_path: Path,tokenizer_root: Path,vocab_sizes:
 
     if not reused:
         started = time.perf_counter()
-        full_vocab, full_merges = train_bpe(
-            str(train_path), maximum_size, [EOT]
-        )
+        full_vocab, full_merges = train_bpe(str(train_path), maximum_size, [EOT])
         training_seconds = time.perf_counter() - started
 
         if len(full_vocab) != maximum_size:
-            raise RuntimeError(
-                f"Requested {maximum_size} tokens but training produced "
-                f"only {len(full_vocab)}"
-            )
+            raise RuntimeError(f"Requested {maximum_size} tokens but training produced "f"only {len(full_vocab)}")
 
         for vocab_size in vocab_sizes:
             vocab = {
@@ -120,24 +115,11 @@ def train_selected_tokenizers(train_path: Path,tokenizer_root: Path,vocab_sizes:
         vocab = load_vocab(str(vocab_path))
         merges = load_merges(str(merges_path))
         if len(vocab) != vocab_size:
-            raise RuntimeError(
-                f"{vocab_path} has {len(vocab)} entries, expected {vocab_size}"
-            )
+            raise RuntimeError(f"{vocab_path} has {len(vocab)} entries, expected {vocab_size}")
         tokenizers[vocab_size] = BPETokenizer(vocab, merges, [EOT])
-        artifacts[str(vocab_size)] = {
-            "vocab_path": str(vocab_path.resolve()),
-            "merges_path": str(merges_path.resolve()),
-            "vocab_sha256": sha256(vocab_path),
-            "merges_sha256": sha256(merges_path),
-        }
+        artifacts[str(vocab_size)] = {"vocab_path": str(vocab_path.resolve()),"merges_path": str(merges_path.resolve()),"vocab_sha256": sha256(vocab_path),"merges_sha256": sha256(merges_path),}
 
-    return tokenizers, {
-        "reused_existing": reused,
-        "training_seconds": training_seconds,
-        "trained_maximum_vocab_size": maximum_size,
-        "artifacts": artifacts,
-    }
-
+    return tokenizers, {"reused_existing": reused,"training_seconds": training_seconds,"trained_maximum_vocab_size": maximum_size,"artifacts": artifacts,}
 
 def iter_boundary_aligned_chunks(
     path: Path,
@@ -162,34 +144,16 @@ def iter_boundary_aligned_chunks(
         yield buffer
 
 
-def encode_to_npy(
-    tokenizer: BPETokenizer,
-    input_path: Path,
-    output_path: Path,
-    read_size: int,
-    force: bool,
-) -> dict[str, object]:
+def encode_to_npy(tokenizer: BPETokenizer,input_path: Path,output_path: Path,read_size: int,force: bool,) -> dict[str, object]:
     """Stream-encode one corpus and atomically create a uint16 .npy file."""
     if output_path.exists() and not force:
         array = np.load(output_path, mmap_mode="r")
         if array.dtype != np.uint16 or array.ndim != 1:
-            raise RuntimeError(
-                f"Existing array {output_path} is not a one-dimensional uint16 array"
-            )
-        return {
-            "output_path": str(output_path.resolve()),
-            "token_count": int(array.shape[0]),
-            "encoding_seconds": 0.0,
-            "reused_existing": True,
-            "dtype": str(array.dtype),
-            "input_bytes": input_path.stat().st_size,
-            "output_bytes": output_path.stat().st_size,
-        }
+            raise RuntimeError(f"Existing array {output_path} is not a one-dimensional uint16 array")
+        return {"output_path": str(output_path.resolve()),"token_count": int(array.shape[0]),"encoding_seconds": 0.0,"reused_existing": True,"dtype": str(array.dtype),"input_bytes": input_path.stat().st_size,"output_bytes": output_path.stat().st_size,}
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_fd, raw_name = tempfile.mkstemp(
-        prefix=f".{output_path.stem}-", suffix=".uint16", dir=output_path.parent
-    )
+    raw_fd, raw_name = tempfile.mkstemp(prefix=f".{output_path.stem}-", suffix=".uint16", dir=output_path.parent)
     os.close(raw_fd)
     raw_path = Path(raw_name)
     npy_path = output_path.with_name(f".{output_path.name}.tmp")
@@ -239,17 +203,7 @@ def encode_to_npy(
     if check.dtype != np.uint16 or check.shape != (token_count,):
         raise RuntimeError(f"Verification failed for {output_path}")
 
-    return {
-        "output_path": str(output_path.resolve()),
-        "token_count": token_count,
-        "minimum_token_id": minimum_id,
-        "maximum_token_id": maximum_id,
-        "encoding_seconds": elapsed,
-        "reused_existing": False,
-        "dtype": str(check.dtype),
-        "input_bytes": input_path.stat().st_size,
-        "output_bytes": output_path.stat().st_size,
-    }
+    return {"output_path": str(output_path.resolve()),"token_count": token_count,"minimum_token_id": minimum_id,"maximum_token_id": maximum_id,"encoding_seconds": elapsed,"reused_existing": False,"dtype": str(check.dtype),"input_bytes": input_path.stat().st_size,"output_bytes": output_path.stat().st_size,}
 
 
 def write_manifest(path: Path, payload: dict[str, object]) -> None:
@@ -257,7 +211,6 @@ def write_manifest(path: Path, payload: dict[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, path)
-
 
 def main() -> None:
     args = parse_args()
@@ -275,16 +228,8 @@ def main() -> None:
         f"{vocab_sizes[0]:,}; comparison vocabularies "
         f"{', '.join(f'{size:,}' for size in vocab_sizes[1:]) or 'none'}"
     )
-    tokenizers, training = train_selected_tokenizers(
-        train_path,
-        args.tokenizer_dir.resolve(),
-        vocab_sizes,
-        args.force,
-    )
-    print(
-        f"Tokenizer preparation complete in {training['training_seconds']:.2f}s "
-        f"(reused={training['reused_existing']})."
-    )
+    tokenizers, training = train_selected_tokenizers(train_path,args.tokenizer_dir.resolve(),vocab_sizes,args.force,)
+    print(f"Tokenizer preparation complete in {training['training_seconds']:.2f}s "f"(reused={training['reused_existing']}).")
 
     encodings: dict[str, object] = {}
     read_size = args.read_size_mib * 1024 * 1024
@@ -295,19 +240,9 @@ def main() -> None:
         ):
             output_path = args.output_dir.resolve() / f"{split}_vocab_{vocab_size}.npy"
             print(f"Encoding {split} with vocabulary {vocab_size:,} -> {output_path}")
-            result = encode_to_npy(
-                tokenizer,
-                input_path,
-                output_path,
-                read_size,
-                args.force,
-            )
+            result = encode_to_npy(tokenizer,input_path,output_path,read_size,args.force,)
             encodings[f"{split}_vocab_{vocab_size}"] = result
-            print(
-                f"  {result['token_count']:,} tokens, {result['dtype']}, "
-                f"{result['encoding_seconds']:.2f}s "
-                f"(reused={result['reused_existing']})"
-            )
+            print(f"  {result['token_count']:,} tokens, {result['dtype']}, "f"{result['encoding_seconds']:.2f}s "f"(reused={result['reused_existing']})")
 
     payload: dict[str, object] = {
         "section": "3.5",
