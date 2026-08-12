@@ -7,12 +7,26 @@ from typing import Iterable, Iterator
 
 import regex
 
+# new imports for 3.2 
+from concurrent.futures import (FIRST_COMPLETED, ProcessPoolExecutor, wait,)
+import heapq # supports best pair selection
+import multiprocessing
+import os
+
+
+
 END_OF_TEXT = "<|endoftext|>"
 
 # gpt2 pre-tokenizer regex from appendix A
 GPT2_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
 GPT2_pretoken_regex = regex.compile(GPT2_PAT)
+
+pre_token_chunksize = 8*1024*1024
+parallel_pretoken_threshold = 16*1024*1024
+max_pretoken_workers = 8
+Pair = tuple[bytes, bytes]
+
+
 
 def validate_special_tokens(special_tokens: list[str] | None, ) -> list[str]:
     # validate and copy the configured special token list
@@ -103,7 +117,213 @@ def merge_word(symbols: tuple[bytes, ...], pair: tuple[bytes, bytes], )->tuple[b
             index += 1
     return tuple(merged)
 
-def train_bpe(
+# NEW 3.2-------------------------------------------------------------------------------------------------
+class _PairHeapEntry:
+    """Pair ordered by highest count, then greatest pair."""
+
+    __slots__ = ("count", "pair")
+
+    def __init__(
+        self,
+        count: int,
+        pair: Pair,
+    ):
+        self.count = count
+        self.pair = pair
+
+    def __lt__(
+        self,
+        other: "_PairHeapEntry",
+    ) -> bool:
+        # heapq is normally a minimum heap, so reverse
+        # the comparisons to obtain maximum behaviour.
+        if self.count != other.count:
+            return self.count > other.count
+
+        # Required tie-break:
+        # lexicographically greatest pair.
+        return self.pair > other.pair
+
+
+def _build_pair_indexes(
+    words: list[tuple[bytes, ...]],
+    frequencies: list[int],
+) -> tuple[
+    Counter,
+    dict[Pair, set[int]],
+    list[_PairHeapEntry],
+]:
+    """Count pairs once and record which words contain them."""
+
+    pair_counts: Counter = Counter()
+    pair_to_word_ids: dict[
+        Pair,
+        set[int],
+    ] = {}
+
+    for word_id, symbols in enumerate(words):
+        frequency = frequencies[word_id]
+
+        # Local Counter is important because a pair can
+        # occur more than once in the same pre-token.
+        local_counts = Counter(
+            zip(symbols, symbols[1:])
+        )
+
+        for pair, occurrences in local_counts.items():
+            pair_counts[pair] += (
+                occurrences * frequency
+            )
+
+            pair_to_word_ids.setdefault(
+                pair,
+                set(),
+            ).add(word_id)
+
+    heap = [
+        _PairHeapEntry(count, pair)
+        for pair, count in pair_counts.items()
+    ]
+    heapq.heapify(heap)
+
+    return pair_counts, pair_to_word_ids, heap
+
+
+def _pop_best_pair(
+    pair_counts: Counter,
+    heap: list[_PairHeapEntry],
+) -> Pair | None:
+    """Return the best pair, ignoring outdated entries."""
+
+    while heap:
+        candidate = heapq.heappop(heap)
+
+        current_count = pair_counts.get(
+            candidate.pair
+        )
+
+        if current_count == candidate.count:
+            return candidate.pair
+
+    return None
+
+
+def _merge_pair_incrementally(
+    best_pair: Pair,
+    words: list[tuple[bytes, ...]],
+    frequencies: list[int],
+    pair_counts: Counter,
+    pair_to_word_ids: dict[Pair, set[int]],
+    heap: list[_PairHeapEntry],
+) -> None:
+    """Update only words containing the selected pair."""
+
+    affected_word_ids = tuple(
+        pair_to_word_ids.get(
+            best_pair,
+            (),
+        )
+    )
+
+    if not affected_word_ids:
+        raise RuntimeError(
+            "Pair index is inconsistent "
+            "with pair counts"
+        )
+
+    # Collect the net changes across all affected
+    # pre-tokens before updating the global counts.
+    count_deltas: Counter = Counter()
+
+    for word_id in affected_word_ids:
+        old_symbols = words[word_id]
+        frequency = frequencies[word_id]
+
+        # Step 1: count the affected word's old pairs.
+        old_local_counts = Counter(
+            zip(
+                old_symbols,
+                old_symbols[1:],
+            )
+        )
+
+        # Step 2: apply the selected merge.
+        new_symbols = merge_word(
+            old_symbols,
+            best_pair,
+        )
+
+        # Step 3: count the affected word's new pairs.
+        new_local_counts = Counter(
+            zip(
+                new_symbols,
+                new_symbols[1:],
+            )
+        )
+
+        # Remove the old pair contributions.
+        for pair, occurrences in (
+            old_local_counts.items()
+        ):
+            count_deltas[pair] -= (
+                occurrences * frequency
+            )
+
+            indexed_words = (
+                pair_to_word_ids.get(pair)
+            )
+
+            if indexed_words is not None:
+                indexed_words.discard(word_id)
+
+                if not indexed_words:
+                    del pair_to_word_ids[pair]
+
+        # Add the new pair contributions.
+        for pair, occurrences in (
+            new_local_counts.items()
+        ):
+            count_deltas[pair] += (
+                occurrences * frequency
+            )
+
+            pair_to_word_ids.setdefault(
+                pair,
+                set(),
+            ).add(word_id)
+
+        words[word_id] = new_symbols
+
+    # Apply the net changes to the global counts.
+    for pair, delta in count_deltas.items():
+        if delta == 0:
+            continue
+
+        new_count = (
+            pair_counts.get(pair, 0)
+            + delta
+        )
+
+        if new_count < 0:
+            raise RuntimeError(
+                "Incremental pair count "
+                "became negative"
+            )
+
+        if new_count == 0:
+            pair_counts.pop(pair, None)
+        else:
+            pair_counts[pair] = new_count
+
+            heapq.heappush(
+                heap,
+                _PairHeapEntry(
+                    new_count,
+                    pair,
+                ),
+            )
+
+def train_bpe_OLD(
     input_path: str,
     vocab_size: int,
     special_tokens: list[str],
@@ -127,11 +347,7 @@ def train_bpe(
             "when using uint16 token IDs"
         )
 
-    with open(
-        input_path,
-        encoding="utf-8",
-        newline="",
-    ) as stream:
+    with open(input_path,encoding="utf-8",newline="",) as stream:
         text = stream.read()
 
     # IDs 0–255 are the corresponding individual bytes.
@@ -193,6 +409,123 @@ def train_bpe(
             new_word_freqs[merged_symbols] += frequency
 
         word_freqs = new_word_freqs
+
+    return vocab, merges
+
+def train_bpe(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str],
+) -> tuple[
+    dict[int, bytes],
+    list[tuple[bytes, bytes]],
+]:
+    """Train BPE using incremental pair counting."""
+
+    special_tokens = validate_special_tokens(
+        special_tokens
+    )
+
+    if vocab_size > 65_536:
+        raise ValueError(
+            "vocab_size must not exceed 65,536 "
+            "when using uint16 token IDs"
+        )
+
+    with open(
+        input_path,
+        encoding="utf-8",
+        newline="",
+    ) as stream:
+        text = stream.read()
+
+    # IDs 0-255 represent their corresponding bytes.
+    vocab: dict[int, bytes] = {
+        byte_value: bytes([byte_value])
+        for byte_value in range(256)
+    }
+
+    # Special tokens come after the byte vocabulary.
+    for special_token in special_tokens:
+        vocab[len(vocab)] = (
+            special_token.encode("utf-8")
+        )
+
+    number_of_merges = (
+        vocab_size - len(vocab)
+    )
+
+    if number_of_merges < 0:
+        raise ValueError(
+            f"vocab_size={vocab_size} "
+            f"is too small; {len(vocab)} "
+            "initial tokens are required"
+        )
+
+    pretoken_counts = count_pretokens(
+        text,
+        special_tokens,
+    )
+
+    # Assign a stable integer ID to each distinct
+    # pre-token. Its symbol tuple will change during
+    # merging, but its ID remains unchanged.
+    words = list(pretoken_counts)
+
+    frequencies = [
+        pretoken_counts[word]
+        for word in words
+    ]
+
+    # Build the pair counts and inverted index once.
+    (
+        pair_counts,
+        pair_to_word_ids,
+        heap,
+    ) = _build_pair_indexes(
+        words,
+        frequencies,
+    )
+
+    merges: list[Pair] = []
+
+    for _ in range(number_of_merges):
+        best_pair = _pop_best_pair(
+            pair_counts,
+            heap,
+        )
+
+        if best_pair is None:
+            break
+
+        vocab[len(vocab)] = (
+            best_pair[0] + best_pair[1]
+        )
+        merges.append(best_pair)
+
+        # This replaces the full pair recount and
+        # the loop over every distinct pre-token.
+        _merge_pair_incrementally(
+            best_pair,
+            words,
+            frequencies,
+            pair_counts,
+            pair_to_word_ids,
+            heap,
+        )
+
+        # Old heap entries are retained temporarily.
+        # Rebuild occasionally to control memory use.
+        if len(heap) > max(
+            100_000,
+            2 * len(pair_counts),
+        ):
+            heap = [
+                _PairHeapEntry(count, pair)
+                for pair, count
+                in pair_counts.items()
+            ]
+            heapq.heapify(heap)
 
     return vocab, merges
 
